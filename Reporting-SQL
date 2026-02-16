@@ -1,4 +1,4 @@
-
+--CTE Finds most recent note per entity id.
 WITH ranked_notes AS (
     SELECT
           n.entity_id
@@ -11,9 +11,10 @@ WITH ranked_notes AS (
           ) AS rn
     FROM ERP_DB.dbo.notes n
     WHERE n.created_at < DATEADD(DAY, 1, GETDATE())
-),
+)
 
-invoice_date_normalized AS (
+-- CTE finds correct invoice date based on integration/system-generated or special-case items
+, invoice_date_normalized AS (
     SELECT
           CAST(inv.invoice_number AS VARCHAR(255)) AS invoice_number
         , CASE
@@ -33,6 +34,7 @@ invoice_date_normalized AS (
       ON integ.invoice_number = CAST(inv.invoice_number AS VARCHAR(255))
 ),
 
+--CTE calculates invoice due date based on payment terms
 due_date_calc AS (
     SELECT
           inv.invoice_id
@@ -137,6 +139,7 @@ LEFT JOIN ranked_notes rn
   ON rn.entity_id = cust.customer_id
  AND rn.rn = 1
 
+-- Left as a join due to more efficient run times
 OUTER APPLY (
     SELECT TOP 1
           n2.entity_id
@@ -146,7 +149,7 @@ OUTER APPLY (
     FROM ERP_DB.dbo.notes n2
     WHERE n2.entity_id = cust.customer_id
       AND n2.note_text LIKE CONCAT('%', inv.invoice_number, '%')
-      AND n2.created_at < DATEADD(DAY, 1, GETDATE())
+      AND n2.created_at < DATEADD(DAY, 1, GETDATE()) -- There are a lot of automated system notes with a note_date of '2050-01-01 00:00:00.000'. This filter removes those. The DATEADD allows for notes taken ahead of our timezone to still be included
     ORDER BY n2.created_at DESC
 ) lin
 
