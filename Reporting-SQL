@@ -1,0 +1,185 @@
+/* ============================================================
+   PUBLIC-SHARE SAFE (Anonymized)
+   - Generic DB/schema/table/column names
+   - Removed business-specific fields / labels
+   - Generalized term codes, item IDs, external system join
+   - Kept structure + logic (including join on rn = 1)
+   ============================================================ */
+
+WITH ranked_notes AS (
+    SELECT
+          n.entity_id
+        , CAST(n.note_text AS NVARCHAR(4000)) AS last_entity_note
+        , n.created_by AS last_entity_note_by
+        , n.created_at AS last_entity_note_date
+        , ROW_NUMBER() OVER (
+            PARTITION BY n.entity_id
+            ORDER BY n.created_at DESC
+          ) AS rn
+    FROM ERP_DB.dbo.notes n
+    WHERE n.created_at < DATEADD(DAY, 1, GETDATE())
+),
+
+invoice_date_normalized AS (
+    SELECT
+          CAST(inv.invoice_number AS VARCHAR(255)) AS invoice_number
+        , CASE
+            WHEN integ.invoice_number IS NOT NULL
+                THEN COALESCE(inv.original_invoice_date, inv.reference_date)
+            ELSE inv.invoice_date
+          END AS invoice_date_effective
+    FROM ERP_DB.dbo.invoice inv
+    LEFT JOIN (
+        SELECT DISTINCT
+            CAST(inv2.invoice_number AS VARCHAR(255)) AS invoice_number
+        FROM ERP_DB.dbo.invoice inv2
+        INNER JOIN ERP_DB.dbo.invoice_line il
+            ON il.invoice_id = inv2.invoice_id
+           AND il.item_id IN (<ITEM_ID_1>, <ITEM_ID_2>)
+    ) integ
+      ON integ.invoice_number = CAST(inv.invoice_number AS VARCHAR(255))
+),
+
+due_date_calc AS (
+    SELECT
+          inv.invoice_id
+        , t.term_code
+        , idn.invoice_date_effective
+        , CASE
+            WHEN t.term_code = 'TERM_A' THEN DATEADD(DAY, 1,  EOMONTH(idn.invoice_date_effective))
+            WHEN t.term_code = 'TERM_B' THEN DATEADD(DAY, 9,  EOMONTH(idn.invoice_date_effective))
+            WHEN t.term_code = 'TERM_C' THEN DATEADD(DAY, 10, EOMONTH(idn.invoice_date_effective))
+            WHEN t.term_code = 'TERM_D' THEN DATEADD(DAY, 15, EOMONTH(idn.invoice_date_effective))
+            WHEN t.term_code = 'TERM_E' THEN DATEADD(DAY, 20, EOMONTH(idn.invoice_date_effective))
+            WHEN t.term_code = 'TERM_F' THEN DATEADD(DAY, 28, EOMONTH(idn.invoice_date_effective))
+            ELSE DATEADD(DAY, t.net_due_days, idn.invoice_date_effective)
+          END AS system_due_date
+    FROM ERP_DB.dbo.invoice inv
+    LEFT JOIN invoice_date_normalized idn
+      ON CAST(inv.invoice_number AS VARCHAR(255)) = idn.invoice_number
+    LEFT JOIN ERP_DB.dbo.payment_terms t
+      ON inv.term_id = t.term_id
+)
+
+SELECT DISTINCT
+      org.unit_name AS org_unit
+    , inv.invoice_number
+    , cust.customer_number
+    , cust.customer_name
+
+    -- invoice attributes (generic)
+    , inv.invoice_date
+    , inv.total_amount
+    , inv.total_credit
+    , inv.total_payment
+    , inv.last_payment_date
+    , inv.balance_due
+
+    -- Aging buckets off reference_date (generic)
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(inv.reference_date AS DATE), CAST(GETDATE() AS DATE)) < 0
+              THEN inv.balance_due ELSE 0 END) AS bucket_ref_pre
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(inv.reference_date AS DATE), CAST(GETDATE() AS DATE)) BETWEEN 0 AND 30
+              THEN inv.balance_due ELSE 0 END) AS bucket_ref_0_30
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(inv.reference_date AS DATE), CAST(GETDATE() AS DATE)) BETWEEN 31 AND 60
+              THEN inv.balance_due ELSE 0 END) AS bucket_ref_31_60
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(inv.reference_date AS DATE), CAST(GETDATE() AS DATE)) BETWEEN 61 AND 90
+              THEN inv.balance_due ELSE 0 END) AS bucket_ref_61_90
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(inv.reference_date AS DATE), CAST(GETDATE() AS DATE)) > 90
+              THEN inv.balance_due ELSE 0 END) AS bucket_ref_over_90
+
+    , CAST(DATEDIFF(DAY, CAST(inv.reference_date AS DATE), EOMONTH(GETDATE())) AS DECIMAL(15,0)) AS age_days_eomonth
+
+    , NULLIF(LTRIM(RTRIM(emp.display_name)), '') AS account_owner
+
+    -- latest entity note (join on rn = 1)
+    , rn.last_entity_note
+    , rn.last_entity_note_by
+    , rn.last_entity_note_date
+
+    -- invoice-specific note (found by searching note text for invoice number)
+    , lin.last_invoice_note
+    , lin.last_invoice_note_by
+    , lin.last_invoice_note_date
+
+    -- due date calcs
+    , dd.term_code
+    , dd.system_due_date
+    , DATEDIFF(DAY, CAST(dd.system_due_date AS DATE), CAST(GETDATE() AS DATE)) AS due_date_diff_days
+
+    -- Aging buckets off system_due_date (generic)
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(dd.system_due_date AS DATE), CAST(GETDATE() AS DATE)) < 0
+              THEN inv.balance_due ELSE 0 END) AS bucket_due_pre
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(dd.system_due_date AS DATE), CAST(GETDATE() AS DATE)) BETWEEN 0 AND 30
+              THEN inv.balance_due ELSE 0 END) AS bucket_due_0_30
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(dd.system_due_date AS DATE), CAST(GETDATE() AS DATE)) BETWEEN 31 AND 60
+              THEN inv.balance_due ELSE 0 END) AS bucket_due_31_60
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(dd.system_due_date AS DATE), CAST(GETDATE() AS DATE)) BETWEEN 61 AND 90
+              THEN inv.balance_due ELSE 0 END) AS bucket_due_61_90
+    , SUM(CASE WHEN DATEDIFF(DAY, CAST(dd.system_due_date AS DATE), CAST(GETDATE() AS DATE)) > 90
+              THEN inv.balance_due ELSE 0 END) AS bucket_due_over_90
+
+FROM ERP_DB.dbo.invoice inv
+
+LEFT JOIN ERP_DB.dbo.org_unit org
+  ON inv.org_unit_id = org.org_unit_id
+
+LEFT JOIN ERP_DB.dbo.customer_site site
+  ON inv.customer_site_id = site.customer_site_id
+
+LEFT JOIN ERP_DB.dbo.customer cust
+  ON site.customer_id = cust.customer_id
+
+LEFT JOIN ERP_DB.dbo.employee emp
+  ON emp.employee_id = cust.owner_employee_id
+
+-- external system join (generalized)
+LEFT JOIN EXT_SYS_DB.dbo.external_invoice ext
+  ON ext.external_invoice_id = inv.external_invoice_id
+
+LEFT JOIN due_date_calc dd
+  ON dd.invoice_id = inv.invoice_id
+
+-- ✅ join directly to ranked_notes with rn = 1 (no second CTE)
+LEFT JOIN ranked_notes rn
+  ON rn.entity_id = cust.customer_id
+ AND rn.rn = 1
+
+OUTER APPLY (
+    SELECT TOP 1
+          n2.entity_id
+        , CAST(n2.note_text AS NVARCHAR(4000)) AS last_invoice_note
+        , n2.created_by AS last_invoice_note_by
+        , n2.created_at AS last_invoice_note_date
+    FROM ERP_DB.dbo.notes n2
+    WHERE n2.entity_id = cust.customer_id
+      AND n2.note_text LIKE CONCAT('%', inv.invoice_number, '%')
+      AND n2.created_at < DATEADD(DAY, 1, GETDATE())
+    ORDER BY n2.created_at DESC
+) lin
+
+WHERE inv.balance_due > 0
+  AND site.is_active = 1
+  AND inv.invoice_date >= <START_DATE_PARAMETER>
+
+GROUP BY
+      org.unit_name
+    , inv.invoice_number
+    , cust.customer_number
+    , cust.customer_name
+    , inv.invoice_date
+    , inv.reference_date
+    , inv.total_amount
+    , inv.total_credit
+    , inv.total_payment
+    , inv.last_payment_date
+    , inv.balance_due
+    , emp.display_name
+    , rn.last_entity_note
+    , rn.last_entity_note_by
+    , rn.last_entity_note_date
+    , lin.last_invoice_note
+    , lin.last_invoice_note_by
+    , lin.last_invoice_note_date
+    , dd.term_code
+    , dd.system_due_date
+;
